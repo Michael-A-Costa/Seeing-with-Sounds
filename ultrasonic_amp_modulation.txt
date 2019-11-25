@@ -1,0 +1,152 @@
+
+
+float aval = 0;
+unsigned char x = 0x0;
+
+
+
+#define TRIG PD2  // trigger pin
+#define ECHO PD3  // echo output
+
+// riseTime and fallTime will be modified by interrupt so we need to declare them as volatile
+volatile unsigned long riseTime;  // timestamp when echo signal goes high
+volatile unsigned long fallTime;  // timestamp when echo signal goes low
+unsigned long pulseTime;          // difference between riseTime and fallTime
+unsigned long distance;           // our range
+
+// Variables for moving average filter
+float prev_vals[] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+float prev_vals_weighted[] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+float range = 0, range_filtered = 21, range_weighted = 0;
+float sum = 0;
+float weighted_sum = 0;
+float std_sum_diff = 0;
+float last_std1_derivative = 0;
+float std_der_integ_time = 0;
+float std_sum = 0;
+float std1 = 0;
+// Amplitude is a function of the distance detected by the sensor.
+short Amp = 0x0500;
+short max_amp = 0x1000;
+unsigned char sin_length = 0x08; // resolution of one sin period. increase in sin length reduces the frequency and creates a cleaner signal.
+float relative_amplitude_offset = 0.50; // range from 0 to 1, this changes pk-pk and offsett. use with caution.
+
+unsigned char global_counter  = 0;
+
+float getDistance() {
+    // clear trig pin
+    PORTD &= ~(1 << TRIG);
+    delayMicroseconds(2);
+
+    // send out 10 us pulse
+    PORTD = (1 << TRIG);
+    delayMicroseconds(10);
+    PORTD &= ~(1 << TRIG);
+
+    // sound travels at 343 m/s which is 0.0343 cm/us
+    // distance = time*velocity
+    // we need to divide result by 2 because sound travels
+    // to object and back so the incoming pulse is twice longer
+    distance = pulseTime * 0.0343 / 2; // result in cm
+    return distance;
+}
+
+
+void setup() {
+    //enable output channel b of timer 1
+    DDRB = _BV(PB2);
+    DDRD |= (1 << TRIG) | _BV(PD5);
+    DDRD &= ~(1 << ECHO);
+
+    //Set up timer 1 to output a ~1KHz sine wave in pwm
+    TIMSK1 |= _BV(OCIE1A);
+    TCCR1A = (1 << WGM10) | _BV(WGM11) | (1 << COM1B1);
+    TCCR1B = (_BV(WGM12) | _BV(WGM13) | _BV(CS10));
+
+    // OCR1A controls the period of the output sine wave, the higher the value the longer the period
+    OCR1A = max_amp;
+    OCR1B = 0x0100;
+
+    PCICR = (1 << PCIE2); // only enabling PCIE2, because PCIE2 constains PCINT[23:16]
+    PCMSK2 = (1 << PCINT19); // only enabling PCINT19
+    sei();
+    Serial.begin(9600);
+}
+
+
+
+void loop() {
+
+    range = getDistance();
+
+    // this variable controls the number of point in the moving average filter
+    int divider = 5;
+
+    if (std_der_integ_time <= range_filtered) {
+        //push the new value and get rid of the oldest
+        for (int i = divider - 1; i > 0; i--)
+            prev_vals[i] = prev_vals[i - 1]; ///(i*(2400/(divider - 2)));
+        // add the newest value and subtract the oldest
+        prev_vals[0] = range;
+        sum = sum + prev_vals[0] - prev_vals[divider - 1];
+        // compute average
+        range_filtered = sum / divider; // - std_der_integ_time;
+    }
+
+
+    //compute standard deviation
+    int i;
+    std_sum = 0;
+    std_sum_diff = 0;
+    for (i = 0; i < divider; i++) {
+        std_sum += sq(range_filtered - prev_vals[i]) + 1;
+        std_sum_diff += range_filtered - prev_vals[i];
+    }
+    //std_sum = std_sum + sq(range_filtered - prev_vals[0]) - sq(range_filtered - prev_vals[divider - 1]);
+    std1 = sqrt(std_sum / divider);
+    float std1_derivative = 1 / std1 * 2 * std_sum_diff * divider * (range_filtered - std1);
+    std_der_integ_time = (std1_derivative - last_std1_derivative) / 2;
+    last_std1_derivative = std1_derivative;
+    //for(int i = divider - 1; i > 0; i--)
+    //    prev_vals_weighted[i] = prev_vals_weighted[i-1];
+
+    //std_sum = 0;
+    //for(i = 0; i < divider; i++)
+    //    weighted_sum += prev_vals[i];
+    //prev_vals[0] = range;
+    //sum = sum + prev_vals[0] - prev_vals[divider-1];
+    //prev_vals_weighted[0]
+
+    //computes the amplitude for a given range. the exponential functio  is around 1 when the range is small and
+    //Amp is a fraction of the maximum amplitude possible so by multiplying it by the sin values(computed in the ISR) we get a sin wave with amplitude that's porportional to the distance by the exponantial finction below.
+    Amp = max_amp * exp(-(range_filtered / 150));
+    Serial.print(range_filtered);
+    Serial.print(" ");
+    //Serial.print((-exp(-10*(std1-2.3)+std1)+std1+100));
+    Serial.print(std_der_integ_time);
+    Serial.print(" ");
+    Serial.print(std1);
+    Serial.print(" ");
+    Serial.println(Amp);
+}
+
+ISR(TIMER1_COMPA_vect) {
+    global_counter++;
+    float sin_val = sin(2 * PI / sin_length * (global_counter % sin_length - 1)); // divide global counter to reduce the frequency of the filtered wave
+    OCR1B = Amp * relative_amplitude_offset * (1 + sin_val);
+}
+
+ISR(PCINT2_vect)
+{
+    if ((PIND & (1 << ECHO)) == (1 << ECHO)) // check if pin PD3 is high
+    {   // Measure time when echo pin goes high
+        riseTime = micros(); // micros() calculates the run time in us since the program's start
+    }
+    else
+    {
+        // measure the time when echo pin goes low
+        fallTime = micros();
+        pulseTime = fallTime - riseTime; // this is our echo pulse, its length is proportional to the measured distance
+    }
+}
+

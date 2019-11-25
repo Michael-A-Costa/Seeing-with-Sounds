@@ -1,0 +1,158 @@
+#define TRIG PD2  // trigger pin
+#define ECHO PD3  // echo output
+#define BUTTON PD1
+
+#define TRIG2 PD4  // trigger pin
+#define ECHO2 PB4  // echo output
+
+// riseTime and fallTime will be modified by interrupt so we need to declare them as volatile
+volatile unsigned long riseTime1 = 0;  // timestamp when echo signal goes high
+volatile unsigned long fallTime1 = 0;  // timestamp when echo signal goes low
+unsigned long pulseTime1 = 0;          // difference between riseTime and fallTime
+unsigned long distance1 = 0;           // our range
+volatile unsigned long riseTime2 = 0;  // timestamp when echo signal goes high
+volatile unsigned long fallTime2 = 0;  // timestamp when echo signal goes low
+unsigned long pulseTime2 = 0;          // difference between riseTime and fallTime
+unsigned long distance2 = 0;
+
+// Variables for moving average filter
+float prev_valsL[] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+float prev_valsR[] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+
+float rangeL = 0, range_filteredL = 0;
+float rangeR = 0, range_filteredR = 0;
+
+float sumL = 0;
+float sumR = 0;
+
+// Amplitude is a function of the distance detected by the sensor.
+float Amp_1 = 200;
+float Amp_2 = 200;
+float max_ampL = 200;
+float max_ampR = 200;
+float sin_vals[] = {0, 0.707106781186547, 1, 0.707106781186548, 0, -0.707106781186547, -1, -0.707106781186548};
+int sin_length_1 = 8; // resolution of one sin period. increase in sin length reduces the frequency and creates a cleaner signal.
+float relative_amplitude_offset = 0.50; // range from 0 to 1, this changes pk-pk and offsett. use with caution.
+
+unsigned char global_counter_1  = 0;
+
+
+void getDistance() {
+    // clear trig pin
+    PORTD &= ~((1 << TRIG) | (1 << TRIG2));
+    delayMicroseconds(2);
+    
+    // send out 10 us pulse
+    PORTD |= ((1 << TRIG) | (1 << TRIG2));
+    delayMicroseconds(10);
+    PORTD &= ~((1 << TRIG) | (1 << TRIG2));
+
+    // sound travels at 343 m/s which is 0.0343 cm/us
+    // distance = time*velocity
+    // we need to divide result by 2 because sound travels
+    // to object and back so the incoming pulse is twice longer
+    distance1 = pulseTime1 * 0.0343 / 2; // result in cm
+    distance2 = pulseTime2 * 0.0343 / 2; // result in cm
+}
+
+
+void setup() {
+    //enable output channel b of timer 1
+    DDRB = _BV(PB2) | _BV(PB1);
+    DDRB &= ~(1 << ECHO2);
+    
+    DDRD |= (1 << TRIG) | _BV(TRIG2);
+    DDRD &= ~(1 << ECHO);
+
+    PORTD |= _BV(BUTTON);
+    //Set up timer 1 to output a ~1KHz sine wave in pwm
+    TIMSK1 = _BV(TOIE1);
+    TCCR1A = 0;
+    TCCR1B = 0;
+    // configures timer 1 to count up to 0x03ff. both OC1A and OC1B are cleared on compare match.
+    TCCR1A = _BV(WGM10) | _BV(WGM11) | (1 << COM1A1) | (1 << COM1B1);
+    TCCR1B = _BV(CS11) | _BV(WGM12);
+
+    // OCR1A and OCR1B controls the period of the output sine wave, the higher the value the longer the period
+    OCR1A = max_ampL / 2;
+    OCR1B = max_ampR / 2;
+
+    PCICR = _BV(PCIE2) | _BV(PCIE0); 
+    PCMSK2 = _BV(PCINT19); 
+    PCMSK0 = _BV(PCINT4);
+    
+    sei();
+}
+
+
+
+void loop() {
+
+    getDistance();
+    rangeL = distance1;
+    rangeR = distance2;
+    // this variable controls the number of point in the moving average filter
+    int divider = 10 ;
+
+    //filter left sensor
+    for (int i = divider - 1; i > 0; i--)
+        prev_valsL[i] = prev_valsL[i - 1]; ///(i*(2400/(divider - 2)));
+    prev_valsL[0] = rangeL;
+    sumL = sumL + prev_valsL[0] - prev_valsL[divider - 1];
+    range_filteredL = sumL / divider;
+
+    //filter right sensor
+    for (int i = divider - 1; i > 0; i--)
+        prev_valsR[i] = prev_valsR[i - 1]; ///(i*(2400/(divider - 2)));
+    prev_valsR[0] = rangeR;
+    sumR = sumR + prev_valsR[0] - prev_valsR[divider - 1];
+    range_filteredR = sumR / divider;
+    //computes the amplitude for a given range. the exponenti
+    //al functio  is around 1 when the range is small and
+    //Amp is a fraction of the maximum amplitude possible so by multiplying it by the sin values(computed in the ISR) we get a sin wave with amplitude that's porportional to the distance by the exponantial finction below.
+    float total_distance = (range_filteredR + range_filteredL);
+    if((PIND & _BV(BUTTON)) == 0x00) {
+        Amp_1 = 200*atan(-(range_filteredL/(4)+total_distance/15))+400;
+        Amp_2 = 200*atan(-(range_filteredR/(4)+total_distance/15))+400;
+    } else if((PIND & _BV(BUTTON)) == _BV(BUTTON)) {
+        Amp_1 = 0;
+        Amp_2 = 0;
+    }
+}
+
+ISR(TIMER1_OVF_vect) {
+    // add comment
+    global_counter_1++;
+    OCR1A = Amp_1 * relative_amplitude_offset * (1 + sin_vals[(global_counter_1 % sin_length_1 - 1)]);
+    OCR1B = Amp_2 * relative_amplitude_offset * (1 + sin_vals[(global_counter_1 % sin_length_1 - 1)]);
+}
+
+ISR(PCINT2_vect)
+{
+    if ((PIND & (1 << ECHO)) == (1 << ECHO)) // check if pin PD3 is high
+    {   // Measure time when echo pin goes high
+        riseTime1 = micros(); // micros() calculates the run time in us since the program's start-
+    }
+    else
+    {
+        // measure the time when echo pin goes low
+        fallTime1 = micros();
+        pulseTime1 = fallTime1 - riseTime1;
+        // this is our echo pulse, its length is proportional to the measured distance
+    }
+}
+
+ISR(PCINT0_vect)
+{
+    if ((PINB & (1 << ECHO2)) == (1 << ECHO2)) // check if pin PD3 is high
+    {   // Measure time when echo pin goes high
+        riseTime2 = micros(); // micros() calculates the run time in us since the program's start
+    }
+    else {
+        // measure the time when echo pin goes low
+        fallTime2 = micros();
+        pulseTime2 = fallTime2 - riseTime2;
+        // this is our echo pulse, its length is proportional to the measured distance
+    }
+}
+

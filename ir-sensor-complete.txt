@@ -1,0 +1,84 @@
+#define IR A0
+#define BUZZER PB5
+#define BUTTON PD2
+
+int buttonPushed=0;
+int divider = 10;
+const int MPU=0x68; 
+float prev_vals_y[] = {0, 0, 0, 0, 0, 0, 0,0,0,0,0,0};
+float sin_vals[] = {0, 0.707106781186547, 1, 0.707106781186548, 0, -0.707106781186547, -1, -0.707106781186548};
+int sin_length_1 = 8; // resolution of one sin period. increase in sin length reduces the frequency and creates a cleaner signal.
+float relative_amplitude_offset = 0.50; // range from 0 to 1, this changes pk-pk and offsett. use with caution.
+float Amp_1 = 0;
+ 
+unsigned char global_counter_1  = 0;
+
+float sum_y = 0;
+float max_amp = 1000;
+
+ISR(TIMER1_OVF_vect) {
+    // add comment
+    global_counter_1++;
+    OCR1B = Amp_1 * relative_amplitude_offset * (1 + sin_vals[(global_counter_1 % sin_length_1 - 1)]);
+}
+
+void setup() 
+{ 
+  DDRB = _BV(BUZZER); 
+  PCICR = _BV(PCIE2);
+  PCMSK2 = _BV(PCINT18);
+    TIMSK1 = _BV(TOIE1);
+    TCCR1A = 0;
+    TCCR1B = 0;
+    // configures timer 1 to count up to 0x03ff. both OC1A and OC1B are cleared on compare match.
+    TCCR1A = _BV(WGM10) | _BV(WGM11) | (1 << COM1B1);
+    TCCR1B = _BV(CS11) | _BV(WGM12);
+    // OCR1A and OCR1B controls the period of the output sine wave, the higher the value the longer the period
+    OCR1B = 0;
+
+  sei();
+}
+
+void loop() 
+{
+    float voltage = analogRead(IR)*(0.0048828125);  // IR val * (5/1024) to get cm
+    int distance = 13*(1/voltage); // from graph on datasheet
+
+    for(int i = divider - 1; i > 0; i--)
+            prev_vals_y[i] = prev_vals_y[i-1];
+    prev_vals_y[0] = distance;
+    sum_y = sum_y + prev_vals_y[0] - prev_vals_y[divider-1];
+    float filtered_sum = sum_y/divider;
+ if(buttonPushed) //button pushed
+  {
+   if (distance <= 30)
+   {
+    if(filtered_sum<=20)
+        PORTB |= _BV(BUZZER);
+        Amp_1 = max_amp;
+    if (filtered_sum>20)
+        PORTB &= ~(_BV(BUZZER));
+        Amp_1 = 0;
+   }
+  }  
+  if (!buttonPushed) //button released
+  { 
+    PORTB &= ~(_BV(BUZZER));
+    Amp_1 = 0;
+  }
+  delay(10); 
+}
+
+// putton pushed only works for the exact moment putton is pushed
+
+ISR(PCINT2_vect) //interrupt service routine
+{
+  if ((PIND & _BV(BUTTON)) == 0) //button not pushed
+  {
+    buttonPushed = 0;
+  }
+  if ((PIND & _BV(BUTTON)) == _BV(BUTTON)) //button pushed
+  {
+    buttonPushed = 1;
+  }
+}
